@@ -3,19 +3,74 @@ import tkinter as tk
 from tkinter import filedialog
 import random
 import subprocess
-import pysrt
 import shutil
-import ffmpeg
+import re
+import json
+
+# Đường dẫn tới file FFMPEG.exe
+ffmpeg_path = r"C:\ffmpeg\bin\ffmpeg.exe"
 
 
-# FFMPEG processing functions
-def process_subtitles(srt_path):
-    subs = pysrt.open(srt_path, encoding="utf-8")
-    return [(sub.start.ordinal, sub.end.ordinal) for sub in subs]
+def process_subtitles(srt_path, cache_folder):
+    with open(srt_path, "r") as file:
+        srt_content = file.read()
+    timecodes = []
+    lines = srt_content.split("\n")
+    index = 0
+
+    while index < len(lines):
+        line = lines[index].strip()
+        if re.match(r"^\d+$", line):
+            index += 1
+            timecode_line = lines[index].strip()
+            timecode_match = re.match(
+                r"^(\d{2}):(\d{2}):(\d{2}),(\d{3})\s-->\s(\d{2}):(\d{2}):(\d{2}),(\d{3})$",
+                timecode_line,
+            )
+            if timecode_match:
+                (
+                    start_hour,
+                    start_minute,
+                    start_second,
+                    start_millisecond,
+                    end_hour,
+                    end_minute,
+                    end_second,
+                    end_millisecond,
+                ) = timecode_match.groups()
+                start_time = (
+                    int(start_hour) * 3600000
+                    + int(start_minute) * 60000
+                    + int(start_second) * 1000
+                    + int(start_millisecond)
+                )
+                end_time = (
+                    int(end_hour) * 3600000
+                    + int(end_minute) * 60000
+                    + int(end_second) * 1000
+                    + int(end_millisecond)
+                )
+                if timecodes:
+                    timecodes[-1][1] = start_time
+                timecodes.append([start_time, end_time])
+            index += 2
+        else:
+            index += 1
+
+    if timecodes:
+        timecodes[0][0] = 0
+
+    if timecodes:
+        timecodes[-1][1] += 5000
+
+    with open(os.path.join(cache_folder, "timecodes.json"), "w") as f:
+        json.dump(timecodes, f)
+
+    return timecodes
 
 
 def get_video_bitrate(video_file):
-    command = f"ffprobe -v error -select_streams v:0 -show_entries stream=bit_rate -of default=noprint_wrappers=1:nokey=1 {video_file}"
+    command = f'{ffmpeg_path} -v error -select_streams v:0 -show_entries stream=bit_rate -of default=noprint_wrappers=1:nokey=1 "{video_file}"'
     result = subprocess.check_output(command, shell=True)
     bitrate = int(result)
     return bitrate
@@ -33,26 +88,20 @@ def process_videos(video_folder, timecodes, cache_folder):
         ]
 
         if last_video and last_video in videos:
-            videos.remove(
-                last_video
-            )  # Ensure the same video is not chosen consecutively
+            videos.remove(last_video)
 
         if not videos:
             log_error("No video files found in the video folder", cache_folder)
             break
 
-        video = random.choice(videos)  # Choose a random video from the list
-        last_video = video  # Store the last video chosen
+        video = random.choice(videos)
+        last_video = video
 
-        # Calculate random start offset
-        start_offset = min(
-            random.randint(0, 300), (end - start)
-        )  # Random value between 0 and 3 seconds (in milliseconds), but not exceeding the timecode span
+        start_offset = min(random.randint(0, 300), (end - start))
 
         output_file = os.path.join(cache_folder, f"{idx:03}.mp4")
 
-        # Cut the re-encoded video
-        command = f"ffmpeg -i {video} -ss {start_offset/1000} -to {(end - start + start_offset)/1000} -c:v libx264 -preset ultrafast -threads 4 -c:a aac {output_file}"
+        command = f'{ffmpeg_path} -i "{video}" -ss {start_offset/1000} -to {(end - start + start_offset)/1000} -c:v libx264 -preset ultrafast -threads 4 -c:a aac "{output_file}"'
         subprocess.run(command, shell=True)
 
         output_files.append(output_file)
@@ -67,7 +116,7 @@ def merge_videos(video_files, cache_folder, output_file):
         for video_file in video_files:
             f.write(f"file '{video_file}'\n")
 
-    command = f"ffmpeg -f concat -safe 0 -i {video_list_file} -c copy {output_file}"
+    command = f'{ffmpeg_path} -f concat -safe 0 -i "{video_list_file}" -c copy "{output_file}"'
     subprocess.run(command, shell=True)
 
     return output_file
@@ -91,21 +140,29 @@ def add_audio(video_file, audio_folder, cache_folder):
 
     audio_file = random.choice(audio_files)
     output_file = os.path.join(cache_folder, "video_with_audio.mp4")
-    command = f"ffmpeg -i {video_file} -i {audio_file} -c:v copy -c:a aac -strict experimental -map 0:v:0 -map 1:a:0 {output_file}"
+    command = f'{ffmpeg_path} -i "{video_file}" -i "{audio_file}" -c:v copy -c:a aac -strict experimental "{output_file}"'
     subprocess.run(command, shell=True)
 
     return output_file
 
 
-def add_subs(video_with_audio, srt_file, cache_folder):
-    output_file = os.path.join(cache_folder, "video_with_subs.mp4")
-    command = f"ffmpeg -i '{video_with_audio}' -vf subtitles='{srt_file}' -c:v libx264 -crf 23 -c:a aac -strict experimental '{output_file}'"
+def add_subs(video_file, srt_file, cache_folder):
+    srt_path = "output_video.srt"
+    output_file = os.path.join(cache_folder, "output_video.mp4")
+
+    # Kiểm tra nếu srt_file và srt_path khác nhau mới thực hiện sao chép
+    if srt_file != srt_path:
+        shutil.copy2(srt_file, srt_path)
+
+    command = (
+        f'{ffmpeg_path} -i "{video_file}" -vf subtitles="{srt_path}" "{output_file}"'
+    )
     subprocess.run(command, shell=True)
 
     return output_file
 
 
-def add_music(video_file, music_folder, cache_folder, output_file):
+def add_music(video_file, music_folder, output_file):
     music_files = [
         os.path.join(music_folder, file)
         for file in os.listdir(music_folder)
@@ -116,7 +173,7 @@ def add_music(video_file, music_folder, cache_folder, output_file):
         return None
 
     music_file = random.choice(music_files)
-    command = f"ffmpeg -i {video_file} -i {music_file} -filter_complex '[0:a][1:a]amix=inputs=2:duration=shortest' -c:v copy {output_file}"
+    command = f'{ffmpeg_path} -i "{video_file}" -i "{music_file}" -filter_complex "[0:a][1:a]amix=inputs=2:duration=shortest" -c:v copy "{output_file}"'
     subprocess.run(command, shell=True)
 
     return output_file
@@ -136,22 +193,45 @@ def select_folder(label):
 def process(
     video_folder, srt_folder, audio_folder, music_folder, cache_folder, output_folder
 ):
-    timecodes = process_subtitles(os.path.join(srt_folder, "subtitles.srt"))
-    video_files = process_videos(video_folder, timecodes, cache_folder)
-    merged_video = merge_videos(
-        video_files, cache_folder, os.path.join(cache_folder, "merged.mp4")
-    )
-    video_with_audio = add_audio(merged_video, audio_folder, cache_folder)
-    if video_with_audio:
-        extracted_audio = os.path.join(cache_folder, "extracted_audio.aac")
-        extract_audio(video_with_audio, extracted_audio)
-        video_with_subs = add_subs(
-            video_with_audio, os.path.join(srt_folder, "subtitles.srt"), cache_folder
+    srt_files = [file for file in os.listdir(srt_folder) if file.endswith(".srt")]
+    if not srt_files:
+        log_error("No SRT files found in the SRT folder", cache_folder)
+        return
+
+    for srt_file in srt_files:
+        srt_path = os.path.join(srt_folder, srt_file)
+        timecodes = process_subtitles(srt_path, cache_folder)
+
+        # Copy file phụ đề vào thư mục cache
+        cache_srt_path = os.path.join(cache_folder, "video_with_audio.srt")
+        shutil.copy2(srt_path, cache_srt_path)
+
+        video_files = process_videos(video_folder, timecodes, cache_folder)
+        merged_video = merge_videos(
+            video_files, cache_folder, os.path.join(cache_folder, "merged.mp4")
         )
-        if video_with_subs:
-            final_video = os.path.join(output_folder, "final.mp4")
-            shutil.move(video_with_subs, final_video)
-            print(f"Final video saved to: {final_video}")
+        video_with_audio = add_audio(merged_video, audio_folder, cache_folder)
+        if video_with_audio:
+            video_with_subs = add_subs(
+                video_with_audio, srt_path, cache_folder
+            )  # Thêm đối số cache_folder vào đây
+            if video_with_subs:
+                final_video = add_music(
+                    video_with_subs,
+                    music_folder,
+                    os.path.join(
+                        cache_folder, f"final_{os.path.splitext(srt_file)[0]}.mp4"
+                    ),
+                )
+                if final_video and os.path.exists(
+                    final_video
+                ):  # Ensure the file exists before renaming
+                    os.rename(
+                        final_video,
+                        os.path.join(
+                            output_folder, f"final_{os.path.splitext(srt_file)[0]}.mp4"
+                        ),
+                    )
 
 
 root = tk.Tk()
